@@ -1,0 +1,15 @@
+@Ofd2PdfService_HostAddress = http://localhost:5000
+
+# Convert an OFD file to PDF
+# Replace the file path below with a real .ofd file path
+POST {{Ofd2PdfService_HostAddress}}/api/convert
+Content-Type: multipart/form-data; boundary=boundary
+
+--boundary
+Content-Disposition: form-data; name="file"; filename="sample.ofd"
+Content-Type: application/octet-stream
+
+< ./sample.ofd
+--boundary--
+
+###
