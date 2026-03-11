@@ -1,3 +1,5 @@
+using iText.Kernel.Pdf;
+using iText.Kernel.Pdf.Annot;
 using Microsoft.AspNetCore.Mvc;
 using Spire.Pdf.Conversion;
 
@@ -70,6 +72,7 @@ public class ConvertController : ControllerBase
             _logger.LogInformation("Converting {FileName} to PDF", file.FileName);
             var converter = new OfdConverter(inputPath);
             converter.ToPdf(outputPath);
+            RemoveEvaluationWarning(outputPath, _logger);
 
             var pdfBytes = await System.IO.File.ReadAllBytesAsync(outputPath);
             var pdfFileName = Path.ChangeExtension(Path.GetFileName(file.FileName), ".pdf");
@@ -91,6 +94,44 @@ public class ConvertController : ControllerBase
         {
             try { Directory.Delete(tmpDir, recursive: true); }
             catch (Exception ex) { _logger.LogWarning(ex, "Failed to clean up temp directory {TmpDir}", tmpDir); }
+        }
+    }
+
+    /// <summary>
+    /// Removes the Spire.PDF evaluation warning annotation from all pages of a PDF file.
+    /// </summary>
+    private static void RemoveEvaluationWarning(string pdfPath, ILogger logger)
+    {
+        var tempPath = pdfPath + ".clean";
+        try
+        {
+            using (var reader = new PdfReader(pdfPath))
+            using (var writer = new PdfWriter(tempPath))
+            using (var doc = new PdfDocument(reader, writer))
+            {
+                for (int i = 1; i <= doc.GetNumberOfPages(); i++)
+                {
+                    var page = doc.GetPage(i);
+                    var annotations = page.GetAnnotations();
+                    for (int j = annotations.Count - 1; j >= 0; j--)
+                    {
+                        var annotation = annotations[j];
+                        var contents = annotation.GetContents();
+                        if (contents != null &&
+                            contents.GetValue().IndexOf("Evaluation Warning", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            page.RemoveAnnotation(annotation);
+                        }
+                    }
+                }
+            }
+            System.IO.File.Move(tempPath, pdfPath, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to remove Spire.PDF evaluation warning from {PdfPath}; the original PDF will be used as-is.", pdfPath);
+            if (System.IO.File.Exists(tempPath))
+                System.IO.File.Delete(tempPath);
         }
     }
 }
