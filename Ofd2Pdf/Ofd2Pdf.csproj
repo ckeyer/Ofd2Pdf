@@ -64,6 +64,15 @@
     <ApplicationIcon>icon.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
+    <Reference Include="itext.commons, Version=9.5.0.0, Culture=neutral, PublicKeyToken=8354ae6d2174ddca">
+      <HintPath>..\packages\itext.commons.9.5.0\lib\net461\itext.commons.dll</HintPath>
+    </Reference>
+    <Reference Include="itext.io, Version=9.5.0.0, Culture=neutral, PublicKeyToken=8354ae6d2174ddca">
+      <HintPath>..\packages\itext.9.5.0\lib\net461\itext.io.dll</HintPath>
+    </Reference>
+    <Reference Include="itext.kernel, Version=9.5.0.0, Culture=neutral, PublicKeyToken=8354ae6d2174ddca">
+      <HintPath>..\packages\itext.9.5.0\lib\net461\itext.kernel.dll</HintPath>
+    </Reference>
     <Reference Include="Spire.Pdf, Version=8.7.9.0, Culture=neutral, PublicKeyToken=663f351905198cb3, processorArchitecture=MSIL">
       <HintPath>..\packages\Spire.PDF.8.7.9\lib\net40\Spire.Pdf.dll</HintPath>
     </Reference>
