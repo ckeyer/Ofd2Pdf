@@ -40,12 +40,58 @@ namespace Ofd2Pdf
             {
                 OfdConverter converter = new OfdConverter(Input);
                 converter.ToPdf(OutPut);
+                RemoveEvaluationWarningPage(OutPut);
                 RemoveEvaluationWarning(OutPut);
                 return ConvertResult.Successful;
             }
             catch (Exception)
             {
                 return ConvertResult.Failed;
+            }
+        }
+
+        /// <summary>
+        /// Removes the first page of the PDF if it contains the Spire.PDF evaluation warning.
+        /// The evaluation warning introduced by the free version of Spire.PDF only appears on the
+        /// first page. Adding a blank page (when necessary) and then deleting the first page
+        /// effectively erases the warning without affecting the remaining content pages.
+        /// </summary>
+        private static void RemoveEvaluationWarningPage(string pdfPath)
+        {
+            var tempPath = pdfPath + ".nocover";
+            try
+            {
+                int totalPages;
+                bool firstPageHasWarning;
+
+                using (var reader = new PdfReader(pdfPath))
+                using (var doc = new PdfDocument(reader))
+                {
+                    totalPages = doc.GetNumberOfPages();
+                    firstPageHasWarning = FindEvaluationWarningRect(doc.GetPage(1)) != null;
+                }
+
+                if (!firstPageHasWarning)
+                    return;
+
+                using (var reader = new PdfReader(pdfPath))
+                using (var writer = new PdfWriter(tempPath))
+                using (var srcDoc = new PdfDocument(reader))
+                using (var destDoc = new PdfDocument(writer))
+                {
+                    if (totalPages > 1)
+                        srcDoc.CopyPagesTo(2, totalPages, destDoc);
+                    else
+                        destDoc.AddNewPage();
+                }
+
+                System.IO.File.Replace(tempPath, pdfPath, destinationBackupFileName: null);
+            }
+            catch (Exception)
+            {
+                // Removal is best-effort; if it fails the original PDF is kept.
+                if (System.IO.File.Exists(tempPath))
+                    System.IO.File.Delete(tempPath);
             }
         }
 
