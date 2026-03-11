@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+FROM mcr.microsoft.com/dotnet/sdk:6.0 AS build
 WORKDIR /src
 
 COPY ["Ofd2PdfService.csproj", "./"]
@@ -7,7 +7,7 @@ RUN dotnet restore "Ofd2PdfService.csproj"
 COPY . .
 RUN dotnet publish "Ofd2PdfService.csproj" -c Release -o /app/publish --no-restore
 
-FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
+FROM mcr.microsoft.com/dotnet/aspnet:6.0 AS runtime
 WORKDIR /app
 
 # Install native font/image dependencies required by Spire.PDF on Linux
