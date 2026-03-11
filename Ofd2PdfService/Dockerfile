@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/dotnet/sdk:6.0 AS build
+FROM registry.yygu.cn/library/dotnet_sdk:6.0 AS build
 WORKDIR /src
 
 COPY ["Ofd2PdfService.csproj", "./"]
