@@ -9,6 +9,7 @@
   <ItemGroup>
     <PackageReference Include="FreeSpire.PDF" Version="11.11.0" />
     <PackageReference Include="itext" Version="9.5.0" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="3.116.1" />
   </ItemGroup>
 
 </Project>
