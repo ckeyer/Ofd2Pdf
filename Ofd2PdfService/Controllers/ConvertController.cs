@@ -77,6 +77,7 @@ public class ConvertController : ControllerBase
             _logger.LogInformation("Converting {FileName} to PDF", file.FileName);
             var converter = new OfdConverter(inputPath);
             converter.ToPdf(outputPath);
+            RemoveEvaluationWarningPage(outputPath, _logger);
             RemoveEvaluationWarning(outputPath, _logger);
 
             var pdfBytes = await System.IO.File.ReadAllBytesAsync(outputPath);
@@ -99,6 +100,51 @@ public class ConvertController : ControllerBase
         {
             try { Directory.Delete(tmpDir, recursive: true); }
             catch (Exception ex) { _logger.LogWarning(ex, "Failed to clean up temp directory {TmpDir}", tmpDir); }
+        }
+    }
+
+    /// <summary>
+    /// Removes the first page of the PDF if it contains the Spire.PDF evaluation warning.
+    /// The evaluation warning introduced by the free version of Spire.PDF only appears on the
+    /// first page. Adding a blank page (when necessary) and then deleting the first page
+    /// effectively erases the warning without affecting the remaining content pages.
+    /// </summary>
+    private static void RemoveEvaluationWarningPage(string pdfPath, ILogger logger)
+    {
+        var tempPath = pdfPath + ".nocover";
+        try
+        {
+            int totalPages;
+            bool firstPageHasWarning;
+
+            using (var reader = new PdfReader(pdfPath))
+            using (var doc = new PdfDocument(reader))
+            {
+                totalPages = doc.GetNumberOfPages();
+                firstPageHasWarning = FindEvaluationWarningRect(doc.GetPage(1)) != null;
+            }
+
+            if (!firstPageHasWarning)
+                return;
+
+            using (var reader = new PdfReader(pdfPath))
+            using (var writer = new PdfWriter(tempPath))
+            using (var srcDoc = new PdfDocument(reader))
+            using (var destDoc = new PdfDocument(writer))
+            {
+                if (totalPages > 1)
+                    srcDoc.CopyPagesTo(2, totalPages, destDoc);
+                else
+                    destDoc.AddNewPage();
+            }
+
+            System.IO.File.Move(tempPath, pdfPath, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to remove Spire.PDF evaluation warning page from {PdfPath}; the original PDF will be used as-is.", pdfPath);
+            if (System.IO.File.Exists(tempPath))
+                System.IO.File.Delete(tempPath);
         }
     }
 
