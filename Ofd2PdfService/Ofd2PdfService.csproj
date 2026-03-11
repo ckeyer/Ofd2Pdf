@@ -7,7 +7,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Spire.PDF" Version="12.2.14" />
+    <PackageReference Include="FreeSpire.PDF" Version="11.11.0" />
     <PackageReference Include="itext" Version="9.5.0" />
   </ItemGroup>
 
