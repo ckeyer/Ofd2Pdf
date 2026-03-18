@@ -6,6 +6,8 @@ using iText.Kernel.Pdf.Canvas.Parser.Data;
 using iText.Kernel.Pdf.Canvas.Parser.Listener;
 using Microsoft.AspNetCore.Mvc;
 using Spire.Pdf.Conversion;
+using System.IO.Compression;
+using System.Xml.Linq;
 using ITextRect = iText.Kernel.Geom.Rectangle;
 
 namespace Ofd2PdfService.Controllers;
@@ -75,8 +77,7 @@ public class ConvertController : ControllerBase
             }
 
             _logger.LogInformation("Converting {FileName} to PDF", file.FileName);
-            var converter = new OfdConverter(inputPath);
-            converter.ToPdf(outputPath);
+            ConvertOfdToPdf(inputPath, outputPath);
             RemoveEvaluationWarningPage(outputPath, _logger);
             RemoveEvaluationWarning(outputPath, _logger);
 
@@ -100,6 +101,372 @@ public class ConvertController : ControllerBase
         {
             try { Directory.Delete(tmpDir, recursive: true); }
             catch (Exception ex) { _logger.LogWarning(ex, "Failed to clean up temp directory {TmpDir}", tmpDir); }
+        }
+    }
+
+    /// <summary>
+    /// Converts an OFD file to PDF, splitting it into batches of up to 3 pages to work
+    /// around the FreeSpire.PDF evaluation version page limit, then merging the results.
+    /// A sanitized copy of the OFD is always created via <see cref="CreateSubOfd"/> before
+    /// conversion so that raw CFF fonts stored with a misleading .otf extension are renamed
+    /// to .cff — preventing a NullReferenceException inside Spire.PDF's OTF font parser.
+    /// </summary>
+    private static void ConvertOfdToPdf(string inputPath, string outputPath)
+    {
+        int totalPages;
+        try { totalPages = GetOfdPageCount(inputPath); }
+        catch { totalPages = 0; }
+
+        if (totalPages <= 0)
+        {
+            // Unknown page count – fall back to direct conversion without sanitization.
+            new OfdConverter(inputPath).ToPdf(outputPath);
+            return;
+        }
+
+        var tmpDir = Path.Combine(Path.GetTempPath(), "ofd2pdf_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tmpDir);
+        try
+        {
+            if (totalPages <= 3)
+            {
+                // Always create a sanitized copy (font renaming, etc.) even for small
+                // documents so that the same CFF font fix applies regardless of page count.
+                var sanitizedOfd = Path.Combine(tmpDir, "sanitized.ofd");
+                CreateSubOfd(inputPath, sanitizedOfd, 0, totalPages);
+                new OfdConverter(sanitizedOfd).ToPdf(outputPath);
+                return;
+            }
+
+            var partPdfs = new List<string>();
+            for (int start = 0; start < totalPages; start += 3)
+            {
+                var partOfd = Path.Combine(tmpDir, $"part_{start}.ofd");
+                var partPdf = Path.Combine(tmpDir, $"part_{start}.pdf");
+                CreateSubOfd(inputPath, partOfd, start, Math.Min(3, totalPages - start));
+                new OfdConverter(partOfd).ToPdf(partPdf);
+                partPdfs.Add(partPdf);
+            }
+            MergePdfs(partPdfs, outputPath);
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// Returns the total number of pages in an OFD file by reading its Document.xml.
+    /// </summary>
+    private static int GetOfdPageCount(string ofdPath)
+    {
+        using var archive = ZipFile.OpenRead(ofdPath);
+
+        var ofdXmlEntry = archive.Entries.FirstOrDefault(
+            e => e.FullName.Equals("OFD.xml", StringComparison.OrdinalIgnoreCase));
+        if (ofdXmlEntry == null) return 0;
+
+        string docRootPath;
+        using (var stream = ofdXmlEntry.Open())
+            docRootPath = XDocument.Load(stream).Descendants()
+                .First(e => e.Name.LocalName == "DocRoot")
+                .Value.Trim().Replace('\\', '/');
+
+        var docEntry = archive.Entries.FirstOrDefault(
+            e => e.FullName.Replace('\\', '/').Equals(docRootPath, StringComparison.OrdinalIgnoreCase));
+        if (docEntry == null) return 0;
+
+        using var docStream = docEntry.Open();
+        return XDocument.Load(docStream).Descendants()
+            .Count(e => e.Name.LocalName == "Page" && e.Attribute("BaseLoc") != null);
+    }
+
+    /// <summary>
+    /// Creates a sub-OFD ZIP file containing only the specified page range.
+    /// All non-page entries (resources, fonts, etc.) are copied as-is so that
+    /// each sub-OFD is a valid, self-contained document.
+    /// Font files with a .otf extension that actually contain raw CFF data (not a
+    /// proper OTF container) are renamed to .cff to prevent FreeSpire.PDF from
+    /// misidentifying them and throwing a NullReferenceException during conversion.
+    /// </summary>
+    private static void CreateSubOfd(string sourcePath, string destPath, int startPage, int pageCount)
+    {
+        using var src = ZipFile.OpenRead(sourcePath);
+
+        var ofdXmlEntry = src.Entries.First(
+            e => e.FullName.Equals("OFD.xml", StringComparison.OrdinalIgnoreCase));
+
+        string docRootPath;
+        using (var stream = ofdXmlEntry.Open())
+            docRootPath = XDocument.Load(stream).Descendants()
+                .First(e => e.Name.LocalName == "DocRoot")
+                .Value.Trim().Replace('\\', '/');
+
+        var docFolder = GetDirectory(docRootPath);
+
+        XDocument docXml;
+        List<XElement> allPages;
+        var docEntry = src.Entries.First(
+            e => e.FullName.Replace('\\', '/').Equals(docRootPath, StringComparison.OrdinalIgnoreCase));
+        using (var stream = docEntry.Open())
+        {
+            docXml = XDocument.Load(stream);
+            allPages = docXml.Descendants()
+                .Where(e => e.Name.LocalName == "Page" && e.Attribute("BaseLoc") != null)
+                .ToList();
+        }
+
+        var selectedPages = allPages.Skip(startPage).Take(pageCount).ToList();
+
+        var pagesFolderPrefix = string.IsNullOrEmpty(docFolder)
+            ? "Pages/"
+            : $"{docFolder}/Pages/";
+
+        var includedPrefixes = selectedPages
+            .Select(p =>
+            {
+                var baseLoc = p.Attribute("BaseLoc")!.Value.Replace('\\', '/').TrimStart('/');
+                // BaseLoc may point to a content file (e.g. Pages/Page_0/Content.xml) or a
+                // directory (e.g. Pages/Page_0).  Derive the directory so that StartsWith
+                // matching covers all files inside that page folder.
+                var pageDir = baseLoc.Contains('/') ? baseLoc[..baseLoc.LastIndexOf('/')] : baseLoc;
+                var fullDir = string.IsNullOrEmpty(docFolder) ? pageDir : $"{docFolder}/{pageDir}";
+                return fullDir + "/";
+            })
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        // Build a rename map for font files that have a .otf extension but contain raw
+        // CFF data.  FreeSpire.PDF uses the file extension to determine how to parse a
+        // font: passing raw CFF bytes to its OTF parser causes a NullReferenceException.
+        // Renaming such files to .cff lets Spire.PDF parse them correctly.
+        // In addition, some raw CFF fonts use CFF Expert Encoding whose glyph lookup
+        // triggers a NullReferenceException deep inside Spire.PDF's CFF renderer even
+        // after renaming.  For those fonts we also strip all TextObject elements that
+        // reference them from the page content, suppressing the crash.
+        // Both PublicRes and DocumentRes resource files are scanned.
+        var resourcePaths = GetResourcePaths(docXml, docFolder);
+        var resourcePathSet = new HashSet<string>(resourcePaths, StringComparer.OrdinalIgnoreCase);
+        var (fontRenameMap, rawCffFontIds) = BuildRawCffFontInfo(src, resourcePaths);
+
+        using var dest = ZipFile.Open(destPath, ZipArchiveMode.Create);
+
+        foreach (var entry in src.Entries)
+        {
+            var name = entry.FullName.Replace('\\', '/');
+            if (name.EndsWith("/")) continue; // skip directory entries
+
+            // Exclude pages that are not in the selected range
+            if (name.StartsWith(pagesFolderPrefix, StringComparison.OrdinalIgnoreCase) &&
+                !includedPrefixes.Any(p => name.StartsWith(p, StringComparison.OrdinalIgnoreCase)))
+                continue;
+
+            if (name.Equals(docRootPath, StringComparison.OrdinalIgnoreCase))
+            {
+                // Write a modified Document.xml referencing only the selected pages
+                var modifiedDoc = new XDocument(docXml);
+                var pagesEl = modifiedDoc.Descendants().First(e => e.Name.LocalName == "Pages");
+                pagesEl.RemoveNodes();
+                foreach (var page in selectedPages)
+                    pagesEl.Add(new XElement(page));
+
+                using var destStream = dest.CreateEntry(name).Open();
+                modifiedDoc.Save(destStream);
+            }
+            else if (fontRenameMap.Count > 0 && resourcePathSet.Contains(name))
+            {
+                // Write a modified resource XML (PublicRes or DocumentRes) with updated
+                // font file names so that references point to the renamed .cff files.
+                XDocument resXml;
+                using (var srcStream = entry.Open())
+                    resXml = XDocument.Load(srcStream);
+
+                var resFolder = GetDirectory(name);
+                var baseLoc = resXml.Root?.Attribute("BaseLoc")?.Value?.Trim().Replace('\\', '/') ?? "";
+                var fontBasePath = CombinePaths(resFolder, baseLoc);
+
+                foreach (var fontFileEl in resXml.Descendants()
+                    .Where(e => e.Name.LocalName == "FontFile"))
+                {
+                    var fontFileName = fontFileEl.Value.Trim().Replace('\\', '/');
+                    var fullFontPath = CombinePaths(fontBasePath, fontFileName);
+                    if (fontRenameMap.TryGetValue(fullFontPath, out var newFullPath))
+                    {
+                        int sep = newFullPath.LastIndexOf('/');
+                        fontFileEl.Value = sep >= 0 ? newFullPath[(sep + 1)..] : newFullPath;
+                    }
+                }
+
+                using var destStream = dest.CreateEntry(name).Open();
+                resXml.Save(destStream);
+            }
+            else if (fontRenameMap.TryGetValue(name, out var renamedPath))
+            {
+                // Copy a font file under its corrected .cff name
+                using var destStream = dest.CreateEntry(renamedPath).Open();
+                using var srcStream = entry.Open();
+                srcStream.CopyTo(destStream);
+            }
+            else if (rawCffFontIds.Count > 0 &&
+                     includedPrefixes.Any(p => name.StartsWith(p, StringComparison.OrdinalIgnoreCase)) &&
+                     name.EndsWith("/Content.xml", StringComparison.OrdinalIgnoreCase))
+            {
+                // Strip any TextObject elements whose Font attribute refers to a raw CFF
+                // font that Spire.PDF cannot render without crashing.  Renaming the font
+                // file to .cff is insufficient for some CFF fonts (e.g. those using Expert
+                // Encoding): Spire.PDF's raw-CFF renderer still throws NullReferenceException.
+                // Removing the offending TextObjects prevents the crash; the rest of the
+                // page content (images, paths, other text) is preserved intact.
+                XDocument contentXml;
+                using (var srcStream = entry.Open())
+                    contentXml = XDocument.Load(srcStream);
+
+                var toRemove = contentXml.Descendants()
+                    .Where(e => e.Name.LocalName == "TextObject" &&
+                                rawCffFontIds.Contains((string?)e.Attribute("Font") ?? ""))
+                    .ToList();
+                foreach (var el in toRemove)
+                    el.Remove();
+
+                using var destStream = dest.CreateEntry(name).Open();
+                contentXml.Save(destStream);
+            }
+            else
+            {
+                using var destStream = dest.CreateEntry(name).Open();
+                using var srcStream = entry.Open();
+                srcStream.CopyTo(destStream);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Returns the archive paths of resource XML files declared in Document.xml.
+    /// Both <c>PublicRes</c> and <c>DocumentRes</c> elements are checked so that fonts
+    /// embedded via either resource type are included in the rename map.
+    /// </summary>
+    private static List<string> GetResourcePaths(XDocument docXml, string docFolder)
+    {
+        var result = new List<string>();
+        foreach (var elementName in new[] { "PublicRes", "DocumentRes" })
+        {
+            var rel = docXml.Descendants()
+                .FirstOrDefault(e => e.Name.LocalName == elementName)
+                ?.Value.Trim().Replace('\\', '/');
+            if (!string.IsNullOrEmpty(rel))
+                result.Add(CombinePaths(docFolder, rel));
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Combines two path segments, omitting a separator when either part is empty.
+    /// </summary>
+    private static string CombinePaths(string prefix, string suffix)
+    {
+        if (string.IsNullOrEmpty(prefix)) return suffix;
+        if (string.IsNullOrEmpty(suffix)) return prefix;
+        return $"{prefix}/{suffix}";
+    }
+
+    /// <summary>
+    /// Returns the directory portion of an archive path (everything before the last '/'),
+    /// or an empty string if the path contains no '/'.
+    /// </summary>
+    private static string GetDirectory(string path) =>
+        path.Contains('/') ? path[..path.LastIndexOf('/')] : "";
+
+    /// <summary>
+    /// Reads one or more resource XML files (PublicRes / DocumentRes) from the source
+    /// archive and returns:
+    /// <list type="bullet">
+    ///   <item>a mapping from the original archive path of each font file whose name ends
+    ///   in ".otf" but whose content is raw CFF data (not a proper OTF/TrueType container)
+    ///   to its corrected ".cff" archive path; and</item>
+    ///   <item>the set of Font element IDs (e.g. "764") for those raw-CFF fonts, used to
+    ///   strip problematic TextObject elements from page content.</item>
+    /// </list>
+    /// Both collections are empty when no such fonts exist.
+    /// </summary>
+    private static (Dictionary<string, string> RenameMap, HashSet<string> RawCffFontIds)
+        BuildRawCffFontInfo(ZipArchive src, IEnumerable<string> resourcePaths)
+    {
+        var renameMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var rawCffFontIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var resourcePath in resourcePaths)
+        {
+            var resEntry = src.Entries.FirstOrDefault(
+                e => e.FullName.Replace('\\', '/').Equals(resourcePath, StringComparison.OrdinalIgnoreCase));
+            if (resEntry == null) continue;
+
+            XDocument resXml;
+            using (var stream = resEntry.Open())
+                resXml = XDocument.Load(stream);
+
+            var resFolder = GetDirectory(resourcePath);
+            var baseLoc = resXml.Root?.Attribute("BaseLoc")?.Value?.Trim().Replace('\\', '/') ?? "";
+            var fontBasePath = CombinePaths(resFolder, baseLoc);
+
+            foreach (var fontEl in resXml.Descendants()
+                .Where(e => e.Name.LocalName == "Font"))
+            {
+                var fontFileEl = fontEl.Descendants()
+                    .FirstOrDefault(e => e.Name.LocalName == "FontFile");
+                if (fontFileEl == null) continue;
+
+                var fontFileName = fontFileEl.Value.Trim().Replace('\\', '/');
+                if (!fontFileName.EndsWith(".otf", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var fullFontPath = CombinePaths(fontBasePath, fontFileName);
+                var fontEntry = src.Entries.FirstOrDefault(
+                    e => e.FullName.Replace('\\', '/').Equals(fullFontPath, StringComparison.OrdinalIgnoreCase));
+                if (fontEntry == null) continue;
+
+                // Read just the first 4 bytes to detect the file type.
+                // A proper OTF/TrueType container starts with 00 01 00 00 (TrueType) or
+                // 4F 54 54 4F ("OTTO", CFF-based OpenType).  Anything else is treated as
+                // raw CFF data with a misleading extension.
+                var header = new byte[4];
+                using (var fs = fontEntry.Open())
+                {
+                    if (fs.Read(header, 0, 4) < 4) continue;
+                }
+
+                bool isOtfContainer =
+                    (header[0] == 0x00 && header[1] == 0x01 && header[2] == 0x00 && header[3] == 0x00) ||
+                    (header[0] == 0x4F && header[1] == 0x54 && header[2] == 0x54 && header[3] == 0x4F);
+
+                if (!isOtfContainer)
+                {
+                    renameMap[fullFontPath] = fullFontPath[..^4] + ".cff";
+                    var fontId = fontEl.Attribute("ID")?.Value;
+                    if (fontId != null) rawCffFontIds.Add(fontId);
+                }
+            }
+        }
+
+        return (renameMap, rawCffFontIds);
+    }
+
+    /// <summary>
+    /// Merges multiple PDF files into a single output PDF using iText.
+    /// </summary>
+    private static void MergePdfs(IReadOnlyList<string> pdfPaths, string outputPath)
+    {
+        var readers = pdfPaths.Select(p => new PdfReader(p)).ToList();
+        var srcDocs = readers.Select(r => new PdfDocument(r)).ToList();
+        try
+        {
+            using var writer = new PdfWriter(outputPath);
+            using var mergedDoc = new PdfDocument(writer);
+            foreach (var srcDoc in srcDocs)
+                srcDoc.CopyPagesTo(1, srcDoc.GetNumberOfPages(), mergedDoc);
+        }
+        finally
+        {
+            foreach (var doc in srcDocs)
+                try { doc.Close(); } catch { }
         }
     }
 

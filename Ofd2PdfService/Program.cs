@@ -1,3 +1,10 @@
+// Register system font directories with Spire.PDF on Linux so that Chinese (CJK)
+// characters are rendered correctly instead of appearing as squares.
+if (OperatingSystem.IsLinux())
+{
+    Spire.Pdf.PdfDocument.LoadCustomFontFolder("/usr/share/fonts");
+}
+
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddControllers();
@@ -18,3 +25,6 @@ app.UseHttpsRedirection();
 app.MapControllers();
 
 app.Run();
+
+// Expose Program class for WebApplicationFactory in integration tests.
+public partial class Program { }
