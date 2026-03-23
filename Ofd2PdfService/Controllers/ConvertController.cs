@@ -16,6 +16,12 @@ namespace Ofd2PdfService.Controllers;
 [Route("api/[controller]")]
 public class ConvertController : ControllerBase
 {
+    /// <summary>
+    /// Maximum number of OFD page batches to convert concurrently per request.
+    /// Capped to avoid saturating the CPU when multiple requests run in parallel.
+    /// </summary>
+    private const int MaxParallelConversions = 4;
+
     private readonly ILogger<ConvertController> _logger;
 
     public ConvertController(ILogger<ConvertController> logger)
@@ -77,14 +83,33 @@ public class ConvertController : ControllerBase
             }
 
             _logger.LogInformation("Converting {FileName} to PDF", file.FileName);
-            ConvertOfdToPdf(inputPath, outputPath);
-            RemoveEvaluationWarning(outputPath, _logger);
+            // Offload CPU-bound conversion work to a thread-pool thread so that the
+            // ASP.NET Core request thread is not blocked for the duration of the
+            // potentially long-running OFD→PDF transformation.
+            await Task.Run(() =>
+            {
+                ConvertOfdToPdf(inputPath, outputPath);
+                RemoveEvaluationWarning(outputPath, _logger);
+            });
 
             var pdfBytes = await System.IO.File.ReadAllBytesAsync(outputPath);
             var pdfFileName = Path.ChangeExtension(Path.GetFileName(file.FileName), ".pdf");
 
             _logger.LogInformation("Conversion succeeded: {FileName}", pdfFileName);
             return File(pdfBytes, "application/pdf", pdfFileName);
+        }
+        catch (AggregateException agex)
+        {
+            // Parallel.ForEach (used inside ConvertOfdToPdf) throws AggregateException.
+            // Flatten and re-throw the first real cause for a cleaner error message.
+            var inner = agex.Flatten().InnerException ?? agex;
+            _logger.LogError(inner, "Conversion failed for {FileName}", file.FileName);
+            return StatusCode(StatusCodes.Status500InternalServerError, new ProblemDetails
+            {
+                Title = "Conversion failed",
+                Detail = inner.Message,
+                Status = StatusCodes.Status500InternalServerError
+            });
         }
         catch (Exception ex)
         {
@@ -138,16 +163,35 @@ public class ConvertController : ControllerBase
                 return;
             }
 
-            var partPdfs = new List<string>();
+            // Precompute all batch descriptors so the two parallel phases below
+            // can work over the same ordered list and the final merge keeps pages
+            // in the correct sequence.
+            var batchParams = new List<(string PartOfd, string PartPdf, int Start, int Count)>();
             for (int start = 0; start < totalPages; start += 3)
             {
-                var partOfd = Path.Combine(tmpDir, $"part_{start}.ofd");
-                var partPdf = Path.Combine(tmpDir, $"part_{start}.pdf");
-                CreateSubOfd(inputPath, partOfd, start, Math.Min(3, totalPages - start));
-                new OfdConverter(partOfd).ToPdf(partPdf);
-                partPdfs.Add(partPdf);
+                batchParams.Add((
+                    Path.Combine(tmpDir, $"part_{start}.ofd"),
+                    Path.Combine(tmpDir, $"part_{start}.pdf"),
+                    start,
+                    Math.Min(3, totalPages - start)));
             }
-            MergePdfs(partPdfs, outputPath);
+
+            // Phase 1: Create all sub-OFD files in parallel.
+            // Each CreateSubOfd call opens its own ZipArchive (ZipFile.OpenRead),
+            // so concurrent reads from the same source file are safe.
+            Parallel.ForEach(batchParams, batch =>
+                CreateSubOfd(inputPath, batch.PartOfd, batch.Start, batch.Count));
+
+            // Phase 2: Convert sub-OFDs to PDFs in parallel, capping concurrency to
+            // avoid overwhelming the system when multiple requests run simultaneously.
+            var parallelOptions = new ParallelOptions
+            {
+                MaxDegreeOfParallelism = Math.Min(Environment.ProcessorCount, MaxParallelConversions)
+            };
+            Parallel.ForEach(batchParams, parallelOptions, batch =>
+                new OfdConverter(batch.PartOfd).ToPdf(batch.PartPdf));
+
+            MergePdfs(batchParams.Select(b => b.PartPdf).ToList(), outputPath);
         }
         finally
         {
